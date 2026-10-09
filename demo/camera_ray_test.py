@@ -3,16 +3,17 @@
 Your right hand is the camera: it looks along wrist -> middle knuckle, image-up is the back of the hand, FOV 60 x 45 deg.
 A cluster of test features is placed in the pinned 'vr' world in front of where the camera points at startup
 (pinch your LEFT hand for ~0.5 s to re-place it). Every update, each feature inside the frustum gets a camera
-measurement that is tight across the view ray (a couple of pixels) and loose along it (depth), i.e. a long ellipsoid.
+bearing measurement with angular uncertainty (a couple of pixels), drawn as a cone.
+Compare --depth-mode sampled (noisy true range) or focal (fixed-distance Gaussian).
 The aligner (in-process, nestbox armdemo branch) back-solves the camera pose from those measurements alone.
 
 Overlay (Unity world): white dots = features; green frustum = true camera (your hand); magenta frustum = back-solved
-camera; translucent cyan = each camera measurement's 1-sigma ellipsoid, placed through the *estimated* pose (they
+camera; cyan = each camera measurement's 1-sigma cone (or Gaussian ellipsoid), placed through the *estimated* pose (they
 should converge on the features); translucent yellow = 2-sigma uncertainty of the solved camera position.
 
 Run (Quest app running; nothing else on ports 12345/8651):
   adb reverse tcp:12345 tcp:12345 && adb reverse tcp:8651 tcp:8651
-  PYTHONPATH=<nestbox repo>/python python camera_ray_test.py [--depth-sigma 0.5] [--pixel-sigma 2] [--fresh-noise]
+  PYTHONPATH=<nestbox repo>/python python camera_ray_test.py [--depth-mode bearing] [--pixel-sigma 2] [--fresh-noise]
 """
 import argparse
 import itertools
@@ -25,7 +26,7 @@ from follow_hand import HandReceiver
 from nestbox_link import OverlayServer, MIRROR, WHITE, GREEN, MAGENTA
 from nestbox.aligner.gauss_newton_aligner import GaussNewtonAligner, _quat_to_matrix, _matrix_to_quat
 from nestbox.coordsystem import CoordinateSystem
-from nestbox.measurement import NormalMeasurement
+from nestbox.measurement import NormalMeasurement, BearingMeasurement
 from nestbox.feature import to_feature
 
 # translucent palette entries (must match NestboxOverlay.cs)
@@ -63,6 +64,23 @@ def ellipsoid(center_rh, cov_rh, k, color, out):
     size = np.maximum(2 * k * np.sqrt(np.maximum(evals, 0)), 0.002)
     out['ellipsoids'].extend([*c, x, y, z, w, *size])
     out['ellipsoidColors'].append(color)
+
+
+def cone(apex, axis, half_angles, length, basis, ring_depth, color, out):
+    """Eight generators and a twelve-segment uncertainty ring, mirrored into Unity."""
+    def rim(theta, depth):
+        offset = basis @ (np.tan(half_angles) * [np.cos(theta), np.sin(theta)])
+        return apex + depth * (axis + offset)
+
+    def line(a, b):
+        out['lines'].extend([*(a * MIRROR), *(b * MIRROR)])
+        out['lineColors'].append(color)
+
+    for theta in np.linspace(0, 2*np.pi, 8, endpoint=False):
+        line(apex, rim(theta, length))
+    ring = [rim(theta, ring_depth) for theta in np.linspace(0, 2*np.pi, 12, endpoint=False)]
+    for i in range(12):
+        line(ring[i], ring[(i+1) % 12])
 
 
 class CameraRayTest:
@@ -120,10 +138,15 @@ class CameraRayTest:
             e2 = np.cross(d, e1)
             d_obs = d + self.sigma_theta * (n[0] * e1 + n[1] * e2)
             d_obs /= np.linalg.norm(d_obs)
-            r = max(np.linalg.norm(pc) + self.args.depth_sigma * n[2], 0.05)
-            cov = (r * self.sigma_theta) ** 2 * (np.eye(3) - np.outer(d_obs, d_obs)) + self.args.depth_sigma ** 2 * np.outer(d_obs, d_obs)
             f = to_feature(f'testpoint/{j}')
-            meas[f] = NormalMeasurement(f, r * d_obs, cov)
+            if self.args.depth_mode == 'bearing':
+                meas[f] = BearingMeasurement(f, d_obs, self.sigma_theta, depth_prior=self.args.depth_prior)
+            else:
+                r = (max(np.linalg.norm(pc) + self.args.depth_sigma * n[2], 0.05)
+                     if self.args.depth_mode == 'sampled' else self.args.focal_distance)
+                cov = ((r * self.sigma_theta) ** 2 * (np.eye(3) - np.outer(d_obs, d_obs))
+                       + self.args.depth_sigma ** 2 * np.outer(d_obs, d_obs))
+                meas[f] = NormalMeasurement(f, r * d_obs, cov)
         with self.aligner.lock:
             self.cam.measurements = meas
         with self.lock:
@@ -161,6 +184,12 @@ class CameraRayTest:
             frustum(R, o, MAGENTA)
             for _, _, c, C in self.aligner.measurement_ellipsoids([self.cam.name]):
                 ellipsoid(c, C, 1.0, T_CYAN, out)
+            with self.aligner.lock:
+                cones = self.aligner.measurement_cones(cs_names=[self.cam.name], include_basis=True)
+                for _, f, apex, axis, angles, length, basis in cones:
+                    estimate = self.aligner.feature_estimates.get(f)
+                    depth = max(float(axis @ (estimate[0] - apex)), 0.0) if estimate is not None else length
+                    cone(apex, axis, angles, length, basis, depth, T_CYAN, out)
             if cov is not None and np.all(np.isfinite(cov)) and np.max(np.linalg.eigvalsh(cov[3:, 3:])) < 1.0:
                 ellipsoid(o, cov[3:, 3:], 2.0, T_YELLOW, out)
         for key in ('lines', 'points', 'ellipsoids'):
@@ -168,10 +197,24 @@ class CameraRayTest:
         return out
 
 
+def depth_prior(value):
+    try:
+        rho, sigma = map(float, value.split(','))
+        if not np.all(np.isfinite([rho, sigma])) or min(rho, sigma) <= 0:
+            raise ValueError
+        return rho, sigma
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected positive rho0,sigma_log (e.g. 2.5,1)')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--pixel-sigma', type=float, default=2.0, help='angular noise, pixels')
     ap.add_argument('--focal', type=float, default=1100.0, help='focal length, pixels (1100 ~ 60 deg FOV at 1280 px)')
+    ap.add_argument('--depth-mode', choices=('sampled', 'focal', 'bearing'), default='bearing',
+                    help='sampled: noisy true range; focal: fixed-depth Gaussian; bearing: angular only (default)')
+    ap.add_argument('--focal-distance', type=float, default=2.5, help='Gaussian focal range, meters')
+    ap.add_argument('--depth-prior', type=depth_prior, help='bearing log-range prior: rho0,sigma_log (e.g. 2.5,1)')
     ap.add_argument('--depth-sigma', type=float, default=0.5, help='depth (along-ray) sigma, meters')
     ap.add_argument('--fresh-noise', action='store_true', help='resample noise every update (default: frozen per feature while in view)')
     ap.add_argument('--convergence-time', type=float, default=0.3, help='aligner time constant, seconds (0 = jump)')
@@ -179,6 +222,11 @@ def main():
     ap.add_argument('--listen-port', type=int, default=12345)
     ap.add_argument('--overlay-port', type=int, default=8651)
     args = ap.parse_args()
+    for name in ('pixel_sigma', 'focal', 'focal_distance', 'depth_sigma', 'hz'):
+        if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            ap.error(f'--{name.replace("_", "-")} must be positive and finite')
+    if args.depth_prior is not None and args.depth_mode != 'bearing':
+        ap.error('--depth-prior requires --depth-mode bearing')
 
     test = CameraRayTest(args)
     receiver = HandReceiver(args.listen_port)
